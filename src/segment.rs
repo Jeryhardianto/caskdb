@@ -29,6 +29,11 @@ pub struct SegmentWriter {
     pub file_id: u64,
     file: File,
     pub size: u64,
+    /// Set when a failed append's rollback (truncating the file back to
+    /// `size`) itself failed. Once poisoned, every further append is
+    /// refused rather than risk writing at an offset that no longer
+    /// matches the file's real, unknown-good length.
+    poisoned: bool,
 }
 
 impl SegmentWriter {
@@ -40,18 +45,66 @@ impl SegmentWriter {
         let path = segment_path(dir, file_id);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let size = file.metadata()?.len();
-        Ok(SegmentWriter { file_id, file, size })
+        Ok(SegmentWriter {
+            file_id,
+            file,
+            size,
+            poisoned: false,
+        })
+    }
+
+    /// Like `open_for_append`, but fails if `file_id`'s segment file
+    /// already exists instead of silently appending to it. Compaction uses
+    /// this for the fresh segments it writes, so a leftover file from a
+    /// previous failed/retried compaction becomes a hard error instead of
+    /// silent (and possibly wrong) reuse.
+    pub fn create_new(dir: &Path, file_id: u64) -> io::Result<Self> {
+        let path = segment_path(dir, file_id);
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)?;
+        Ok(SegmentWriter {
+            file_id,
+            file,
+            size: 0,
+            poisoned: false,
+        })
     }
 
     /// Appends an already-encoded record and fsyncs before returning. Returns
     /// the byte offset within this segment where the record started.
+    ///
+    /// If the write or fsync fails partway (disk full, EIO, ...), the file
+    /// may now hold trailing bytes beyond `size` even though `size` itself
+    /// was never advanced — leaving the two disagreeing would corrupt the
+    /// *next* append (it would compute its offset from the too-small
+    /// `size`, while append-mode writes actually land past the leftover
+    /// garbage). So on any failure this rolls the file back to `size`
+    /// before returning the error; if even that fails, the writer is
+    /// poisoned so no further append can compound the damage.
     pub fn append(&mut self, encoded: &[u8]) -> io::Result<u64> {
         use std::io::Write;
+        if self.poisoned {
+            return Err(io::Error::other(
+                "segment writer is poisoned: a previous failed append could not be rolled back",
+            ));
+        }
+
         let offset = self.size;
-        self.file.write_all(encoded)?;
-        self.file.sync_all()?;
-        self.size += encoded.len() as u64;
-        Ok(offset)
+        match self.file.write_all(encoded).and_then(|()| self.file.sync_all()) {
+            Ok(()) => {
+                self.size += encoded.len() as u64;
+                Ok(offset)
+            }
+            Err(write_err) => {
+                if let Err(rollback_err) = self.file.set_len(self.size) {
+                    self.poisoned = true;
+                    return Err(rollback_err);
+                }
+                Err(write_err)
+            }
+        }
     }
 }
 

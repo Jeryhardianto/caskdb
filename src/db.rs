@@ -114,6 +114,13 @@ impl CaskDb {
     /// segments' raw bytes in isolation, and why the active segment gets
     /// renumbered above the compacted output rather than the other way
     /// around.
+    ///
+    /// On failure (disk full, EIO, ...) this leaves `self.index` and
+    /// `self.active` completely untouched — every fallible step happens
+    /// before anything observable is mutated — and deletes whatever
+    /// compacted segment files it had managed to create, so a retry starts
+    /// from a clean slate instead of compounding the first attempt's
+    /// partial output.
     pub fn compact(&mut self) -> Result<(), Error> {
         let old_active_id = self.active.file_id;
         let sealed_ids: HashSet<u64> = list_segment_ids(&self.dir)
@@ -147,12 +154,53 @@ impl CaskDb {
             }
         }
 
-        // 2. Write the relocated keys into fresh segment(s), numbered
-        //    starting just above the current active id so they can never
-        //    collide with an existing sealed or active segment file.
+        // 2. Write the relocated keys into fresh segment(s) and rename the
+        //    active segment above them, staging every index change in
+        //    local variables so a failure anywhere in this step touches
+        //    neither `self.index` nor `self.active`.
+        let mut written_ids: Vec<u64> = Vec::new();
+        let commit = self.write_and_commit_compacted_segments(old_active_id, &to_relocate, &mut written_ids);
+
+        if let Err(e) = commit {
+            // Nothing in `self` changed; only delete the orphaned output
+            // files this attempt managed to create before it failed.
+            for id in &written_ids {
+                let _ = std::fs::remove_file(segment_path(&self.dir, *id));
+            }
+            return Err(e);
+        }
+
+        // 3. Any cached reader may point at a file_id whose backing file
+        //    just moved or disappeared; drop them all and let get() reopen
+        //    lazily by the (now-correct) index entries.
+        self.readers.borrow_mut().clear();
+
+        // 4. The old sealed segments are now fully superseded.
+        for id in sealed_ids {
+            std::fs::remove_file(segment_path(&self.dir, id)).map_err(Error::Io)?;
+        }
+
+        Ok(())
+    }
+
+    /// Does the fallible part of compaction: writes `to_relocate` into
+    /// fresh segments (recording their ids in `written_ids` as they're
+    /// created, so the caller can clean up on error) and renames the
+    /// active segment above them. Everything here either succeeds
+    /// completely or returns `Err` without having touched `self.index` or
+    /// `self.active` — the index/active updates below the rename are all
+    /// infallible, so once the rename succeeds this cannot fail partway.
+    fn write_and_commit_compacted_segments(
+        &mut self,
+        old_active_id: u64,
+        to_relocate: &[(Vec<u8>, Vec<u8>)],
+        written_ids: &mut Vec<u64>,
+    ) -> Result<(), Error> {
         let mut next_id = old_active_id;
         let mut writer: Option<SegmentWriter> = None;
-        for (key, value) in &to_relocate {
+        let mut staged_index: Vec<(Vec<u8>, IndexEntry)> = Vec::new();
+
+        for (key, value) in to_relocate {
             let record = Record::new(key, value);
             let encoded = record.encode();
             let needs_new = match &writer {
@@ -163,11 +211,12 @@ impl CaskDb {
             };
             if needs_new {
                 next_id += 1;
-                writer = Some(SegmentWriter::open_for_append(&self.dir, next_id).map_err(Error::Io)?);
+                writer = Some(SegmentWriter::create_new(&self.dir, next_id).map_err(Error::Io)?);
+                written_ids.push(next_id);
             }
             let w = writer.as_mut().expect("writer just ensured present");
             let offset = w.append(&encoded).map_err(Error::Io)?;
-            self.index.insert(
+            staged_index.push((
                 key.clone(),
                 IndexEntry {
                     file_id: w.file_id,
@@ -175,37 +224,32 @@ impl CaskDb {
                     value_size: value.len() as u32,
                     timestamp: record.timestamp,
                 },
-            );
+            ));
         }
 
-        // 3. Renumber the active segment above every id just written, so
-        //    file_id ordering still reflects recency after this
-        //    compaction (see spec: without this, a future `open()` would
-        //    replay the compacted output as if it were newer than the
-        //    active segment's real, more recent writes).
+        // Renumber the active segment above every id just written, so
+        // file_id ordering still reflects recency after this compaction
+        // (see spec: without this, a future `open()` would replay the
+        // compacted output as if it were newer than the active segment's
+        // real, more recent writes). The already-open file handle stays
+        // valid across the rename on Unix, so no reopen is needed — which
+        // also removes a failure window between "renamed" and "reopened".
         let new_active_id = next_id + 1;
         std::fs::rename(
             segment_path(&self.dir, old_active_id),
             segment_path(&self.dir, new_active_id),
         )
         .map_err(Error::Io)?;
-        self.active = SegmentWriter::open_for_append(&self.dir, new_active_id).map_err(Error::Io)?;
 
+        for (key, entry) in staged_index {
+            self.index.insert(key, entry);
+        }
         for entry in self.index.values_mut() {
             if entry.file_id == old_active_id {
                 entry.file_id = new_active_id;
             }
         }
-
-        // 4. Any cached reader may point at a file_id whose backing file
-        //    just moved or disappeared; drop them all and let get() reopen
-        //    lazily by the (now-correct) index entries.
-        self.readers.borrow_mut().clear();
-
-        // 5. The old sealed segments are now fully superseded.
-        for id in sealed_ids {
-            std::fs::remove_file(segment_path(&self.dir, id)).map_err(Error::Io)?;
-        }
+        self.active.file_id = new_active_id;
 
         Ok(())
     }

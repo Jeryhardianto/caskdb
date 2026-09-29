@@ -2,6 +2,30 @@ use caskdb::{CaskDb, Options};
 use tempfile::tempdir;
 
 #[test]
+fn overwrite_after_compact_survives_reopen() {
+    // Pins the fix for the file_id-ordering bug caught during planning: if
+    // the active segment isn't renumbered above the compacted output, a
+    // key overwritten *after* compact() sorts as older than the compacted
+    // data on the next open() and the overwrite is silently lost.
+    let dir = tempdir().unwrap();
+    {
+        let mut db = CaskDb::open_with_options(
+            dir.path(),
+            Options {
+                max_segment_size: 40,
+            },
+        )
+        .unwrap();
+        db.put(b"k", b"old").unwrap();
+        db.put(b"z", b"zz").unwrap(); // rolls, seals segment 0
+        db.compact().unwrap();
+        db.put(b"k", b"new").unwrap();
+    }
+    let db = CaskDb::open(dir.path()).unwrap();
+    assert_eq!(db.get(b"k").unwrap(), Some(b"new".to_vec()));
+}
+
+#[test]
 fn compact_is_a_safe_no_op_when_nothing_is_sealed_yet() {
     let dir = tempdir().unwrap();
     let mut db = CaskDb::open(dir.path()).unwrap();
