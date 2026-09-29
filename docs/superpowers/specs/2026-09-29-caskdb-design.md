@@ -60,8 +60,8 @@ the index only ever reflects live keys. `value_pos` is the byte offset of the
 **value payload itself** (i.e. past crc/timestamp/flags/key_len/val_len/key),
 so `get` is exactly one `pread(value_pos, value_size)` with no header
 re-parsing and no CRC re-check on the hot path — CRC is only verified during
-the sequential replay in recovery and compaction, matching how Bitcask's
-KeyDir/hint-file lookup works.
+the sequential replay in recovery, matching how Bitcask's KeyDir/hint-file
+lookup works.
 
 ## Recovery (on `open`)
 
@@ -86,10 +86,21 @@ KeyDir/hint-file lookup works.
 
 1. Identify all sealed (non-active) segments (every existing segment file
    whose id is not the current active segment's id).
-2. Replay them in `file_id` order into a temporary `HashMap<Vec<u8>, (record
-   bytes, is_tombstone)>`, keeping only the latest record per key (later
-   `file_id`/offset wins).
-3. Write every surviving **non-tombstone** entry into one or more new
+2. Find every key whose **live index entry** currently points at one of
+   those sealed segments, and read its current value the same way `get`
+   does (one `pread` at the entry's `value_pos`/`value_size`, no CRC
+   re-check). This is a deliberate choice, not a shortcut: an earlier
+   version of this design instead re-derived "which keys survive" by
+   replaying the raw bytes of the sealed segments in isolation (tracking
+   tombstones seen within that replay). That is wrong — a key can be
+   overwritten or deleted by a write to the *active* segment after its
+   old copy was already sealed, and the active segment is never part of
+   this replay, so that approach silently resurrects stale data the live
+   index had already correctly forgotten or superseded. The live index
+   is always the authoritative record of what's current, for exactly the
+   same reason `get` trusts it without re-verifying the segment file
+   directly.
+3. Write every relocated key's current value into one or more new
    compacted segment files (respecting the same max-size-per-segment rule),
    with fresh `file_id`s starting at `old_active_id + 1` and increasing.
    Starting above the *current* active id (rather than reusing the low end
