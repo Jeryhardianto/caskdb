@@ -2,7 +2,7 @@
 
 An embeddable key-value store in Rust. Log-structured, Bitcask-style: every
 write is appended to a segment file, an in-memory hash index maps each key
-to its (segment, offset), and reads are a single positioned read — no
+to its (segment, offset), and reads are a single positioned read: no
 scans, no tree traversal.
 
 Single-threaded, fsyncs on every write, crash-safe by construction (an
@@ -55,7 +55,7 @@ renumbers the active segment to keep file_id ordering meaningful.
 
 - No concurrent access without external locking (wrap in `Arc<Mutex<_>>`
   if you need it from multiple threads).
-- No automatic/background compaction — call `compact()` yourself.
+- No automatic/background compaction. Call `compact()` yourself.
 - No range scans or ordered iteration.
 - Compaction's file-swap isn't atomic across a crash: if the process dies
   mid-compaction, the next `open()` may see both old and new segments,
