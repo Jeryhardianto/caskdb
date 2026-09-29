@@ -47,9 +47,21 @@ OK
 
 ## Design
 
-See `docs/superpowers/specs/2026-09-29-caskdb-design.md` for the full
-design: on-disk record format, recovery algorithm, and how compaction
-renumbers the active segment to keep file_id ordering meaningful.
+Every write is a length-prefixed record with a CRC:
+`[crc][timestamp][flags][key_len][val_len][key][value]`. The `flags` byte
+marks a tombstone, so an empty value and a deleted key stay
+distinguishable by more than length.
+
+`open()` replays every segment file in order to rebuild the index. A torn
+record at the tail of the newest segment (the shape an unclean shutdown
+leaves) gets truncated away; the same failure earlier in the file counts
+as real corruption and returns an error instead.
+
+`compact()` relocates every key whose live index entry still points at a
+sealed segment into fresh, smaller segments numbered above the current
+active segment, then renames the active segment to an id higher than that
+output. Skip the rename and a later `open()` would replay the compacted
+data as newer than the active segment's real, more recent writes.
 
 ## Known limitations
 
