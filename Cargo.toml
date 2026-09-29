@@ -2,6 +2,8 @@
 name = "caskdb"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Embeddable, log-structured (Bitcask-style) key-value store with crash recovery and manual compaction"
 
 [dependencies]
 crc32fast = "1"
