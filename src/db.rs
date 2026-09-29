@@ -1,11 +1,11 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 use crate::index::{recover, Index, IndexEntry};
 use crate::record::Record;
-use crate::segment::{SegmentReader, SegmentWriter};
+use crate::segment::{list_segment_ids, segment_path, SegmentReader, SegmentWriter};
 
 /// Tunable knobs for a [`CaskDb`]. `Options::default()` matches the spec's
 /// default of 64 MiB segments.
@@ -104,6 +104,109 @@ impl CaskDb {
             let new_id = self.active.file_id + 1;
             self.active = SegmentWriter::open_for_append(&self.dir, new_id).map_err(Error::Io)?;
         }
+        Ok(())
+    }
+
+    /// Merges all sealed (non-active) segments into fresh, smaller
+    /// segments, dropping stale/overwritten/deleted entries. See the
+    /// design spec's "Compaction" section for why this relocates keys by
+    /// consulting the live index rather than replaying the sealed
+    /// segments' raw bytes in isolation, and why the active segment gets
+    /// renumbered above the compacted output rather than the other way
+    /// around.
+    pub fn compact(&mut self) -> Result<(), Error> {
+        let old_active_id = self.active.file_id;
+        let sealed_ids: HashSet<u64> = list_segment_ids(&self.dir)
+            .map_err(Error::Io)?
+            .into_iter()
+            .filter(|id| *id != old_active_id)
+            .collect();
+        if sealed_ids.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Find every key whose *live* index entry points at a sealed
+        //    segment, and read its current value the same way get() does.
+        let mut to_relocate: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        {
+            let mut readers = self.readers.borrow_mut();
+            for (key, entry) in self.index.iter() {
+                if !sealed_ids.contains(&entry.file_id) {
+                    continue;
+                }
+                if !readers.contains_key(&entry.file_id) {
+                    let reader =
+                        SegmentReader::open(&self.dir, entry.file_id).map_err(Error::Io)?;
+                    readers.insert(entry.file_id, reader);
+                }
+                let reader = readers.get(&entry.file_id).unwrap();
+                let value = reader
+                    .read_at(entry.value_pos, entry.value_size)
+                    .map_err(Error::Io)?;
+                to_relocate.push((key.clone(), value));
+            }
+        }
+
+        // 2. Write the relocated keys into fresh segment(s), numbered
+        //    starting just above the current active id so they can never
+        //    collide with an existing sealed or active segment file.
+        let mut next_id = old_active_id;
+        let mut writer: Option<SegmentWriter> = None;
+        for (key, value) in &to_relocate {
+            let record = Record::new(key, value);
+            let encoded = record.encode();
+            let needs_new = match &writer {
+                None => true,
+                Some(w) => {
+                    w.size > 0 && w.size + encoded.len() as u64 > self.options.max_segment_size
+                }
+            };
+            if needs_new {
+                next_id += 1;
+                writer = Some(SegmentWriter::open_for_append(&self.dir, next_id).map_err(Error::Io)?);
+            }
+            let w = writer.as_mut().expect("writer just ensured present");
+            let offset = w.append(&encoded).map_err(Error::Io)?;
+            self.index.insert(
+                key.clone(),
+                IndexEntry {
+                    file_id: w.file_id,
+                    value_pos: offset + record.value_offset() as u64,
+                    value_size: value.len() as u32,
+                    timestamp: record.timestamp,
+                },
+            );
+        }
+
+        // 3. Renumber the active segment above every id just written, so
+        //    file_id ordering still reflects recency after this
+        //    compaction (see spec: without this, a future `open()` would
+        //    replay the compacted output as if it were newer than the
+        //    active segment's real, more recent writes).
+        let new_active_id = next_id + 1;
+        std::fs::rename(
+            segment_path(&self.dir, old_active_id),
+            segment_path(&self.dir, new_active_id),
+        )
+        .map_err(Error::Io)?;
+        self.active = SegmentWriter::open_for_append(&self.dir, new_active_id).map_err(Error::Io)?;
+
+        for entry in self.index.values_mut() {
+            if entry.file_id == old_active_id {
+                entry.file_id = new_active_id;
+            }
+        }
+
+        // 4. Any cached reader may point at a file_id whose backing file
+        //    just moved or disappeared; drop them all and let get() reopen
+        //    lazily by the (now-correct) index entries.
+        self.readers.borrow_mut().clear();
+
+        // 5. The old sealed segments are now fully superseded.
+        for id in sealed_ids {
+            std::fs::remove_file(segment_path(&self.dir, id)).map_err(Error::Io)?;
+        }
+
         Ok(())
     }
 }
