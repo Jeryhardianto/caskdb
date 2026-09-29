@@ -1073,13 +1073,26 @@ git commit -m "test: add end-to-end crash-recovery regression test"
 
 **Interfaces:**
 - Consumes: `crate::segment::{list_segment_ids, segment_path,
-  SegmentWriter}` (Task 2), `crate::record::Record` (Task 1),
-  `crate::index::IndexEntry` (Task 3), and `CaskDb`'s private fields
+  SegmentWriter, SegmentReader}` (Task 2), `crate::record::Record` (Task
+  1), `crate::index::IndexEntry` (Task 3), and `CaskDb`'s private fields
   (Task 4) — this method lives directly in `src/db.rs`, in the same
   module as the `CaskDb` struct definition, specifically so it can reach
   those private fields without needing `pub(crate)` visibility changes.
 - Produces: `CaskDb::compact(&mut self) -> Result<(), Error>`. Nothing
   later depends on this.
+
+**Design note (read before implementing):** compaction must decide which
+keys currently in a sealed segment are still "live" — i.e. not later
+overwritten or deleted. The *only* correct source for that is the live
+`self.index`, not a fresh replay of the sealed segments' raw bytes: a key
+sealed in segment 0 could since have been deleted or overwritten by a
+write that landed in the *active* segment, and the active segment is
+never part of what's being compacted. A replay confined to the sealed
+segments alone cannot see that later tombstone/overwrite and would
+resurrect stale data. So: find every key whose live index entry points at
+a sealed segment, read its *current* value the same way `get` does (a
+`pread` via the entry's `value_pos`/`value_size`, trusting the index —
+no re-parsing, no CRC check), and relocate exactly that.
 
 - [ ] **Step 1: Add `compact()` to `src/db.rs`**
 
@@ -1087,6 +1100,7 @@ Add these imports to the top of `src/db.rs`:
 
 ```rust
 use crate::segment::{list_segment_ids, segment_path};
+use std::collections::HashSet;
 ```
 
 Add this method inside the existing `impl CaskDb { ... }` block (after
@@ -1094,52 +1108,53 @@ Add this method inside the existing `impl CaskDb { ... }` block (after
 
 ```rust
     /// Merges all sealed (non-active) segments into fresh, smaller
-    /// segments, dropping stale/overwritten entries and tombstones. See
-    /// the design spec's "Compaction" section for why the active segment
-    /// gets renumbered above the compacted output rather than the other
-    /// way around.
+    /// segments, dropping stale/overwritten/deleted entries. See the
+    /// design spec's "Compaction" section for why this relocates keys by
+    /// consulting the live index rather than replaying the sealed
+    /// segments' raw bytes in isolation, and why the active segment gets
+    /// renumbered above the compacted output rather than the other way
+    /// around.
     pub fn compact(&mut self) -> Result<(), Error> {
         let old_active_id = self.active.file_id;
-        let mut sealed_ids: Vec<u64> = list_segment_ids(&self.dir)
+        let sealed_ids: HashSet<u64> = list_segment_ids(&self.dir)
             .map_err(Error::Io)?
             .into_iter()
             .filter(|id| *id != old_active_id)
             .collect();
-        sealed_ids.sort_unstable();
         if sealed_ids.is_empty() {
             return Ok(());
         }
 
-        // 1. Replay sealed segments, keeping only the latest surviving
-        //    (non-tombstone) encoded record per key.
-        let mut survivors: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-        for id in &sealed_ids {
-            let bytes = std::fs::read(segment_path(&self.dir, *id)).map_err(Error::Io)?;
-            let mut cursor = 0usize;
-            while cursor < bytes.len() {
-                let (record, consumed) = Record::decode(&bytes[cursor..]).map_err(|e| {
-                    Error::Corruption(format!(
-                        "segment {id} corrupt at offset {cursor} during compaction: {e:?}"
-                    ))
-                })?;
-                if record.is_tombstone() {
-                    survivors.remove(&record.key);
-                } else {
-                    survivors.insert(
-                        record.key.clone(),
-                        bytes[cursor..cursor + consumed].to_vec(),
-                    );
+        // 1. Find every key whose *live* index entry points at a sealed
+        //    segment, and read its current value the same way get() does.
+        let mut to_relocate: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        {
+            let mut readers = self.readers.borrow_mut();
+            for (key, entry) in self.index.iter() {
+                if !sealed_ids.contains(&entry.file_id) {
+                    continue;
                 }
-                cursor += consumed;
+                if !readers.contains_key(&entry.file_id) {
+                    let reader =
+                        SegmentReader::open(&self.dir, entry.file_id).map_err(Error::Io)?;
+                    readers.insert(entry.file_id, reader);
+                }
+                let reader = readers.get(&entry.file_id).unwrap();
+                let value = reader
+                    .read_at(entry.value_pos, entry.value_size)
+                    .map_err(Error::Io)?;
+                to_relocate.push((key.clone(), value));
             }
         }
 
-        // 2. Write survivors into fresh segment(s), numbered starting just
-        //    above the current active id so they can never collide with an
-        //    existing sealed or active segment file.
+        // 2. Write the relocated keys into fresh segment(s), numbered
+        //    starting just above the current active id so they can never
+        //    collide with an existing sealed or active segment file.
         let mut next_id = old_active_id;
         let mut writer: Option<SegmentWriter> = None;
-        for (key, encoded) in &survivors {
+        for (key, value) in &to_relocate {
+            let record = Record::new(key, value);
+            let encoded = record.encode();
             let needs_new = match &writer {
                 None => true,
                 Some(w) => {
@@ -1151,15 +1166,13 @@ Add this method inside the existing `impl CaskDb { ... }` block (after
                 writer = Some(SegmentWriter::open_for_append(&self.dir, next_id).map_err(Error::Io)?);
             }
             let w = writer.as_mut().expect("writer just ensured present");
-            let offset = w.append(encoded).map_err(Error::Io)?;
-            let (record, _) =
-                Record::decode(encoded).expect("survivor record already validated above");
+            let offset = w.append(&encoded).map_err(Error::Io)?;
             self.index.insert(
                 key.clone(),
                 IndexEntry {
                     file_id: w.file_id,
                     value_pos: offset + record.value_offset() as u64,
-                    value_size: record.value.len() as u32,
+                    value_size: value.len() as u32,
                     timestamp: record.timestamp,
                 },
             );
@@ -1266,28 +1279,37 @@ fn compact_drops_overwritten_and_deleted_keys_but_keeps_final_state() {
 #[test]
 fn compact_preserves_keys_that_live_in_the_active_segment() {
     let dir = tempdir().unwrap();
+    // Encoded record size = 21 (header) + key.len() + value.len(). These
+    // two fillers are 49 bytes each (8-byte key + 20-byte value), so after
+    // both are written the running size is 98 — still under 100, no roll
+    // yet. A third, smaller filler (30 bytes) then pushes the running size
+    // to 128, past the 100-byte threshold, sealing segment 0 with all
+    // three fillers in it and rolling to a fresh, empty segment 1.
     let mut db = CaskDb::open_with_options(
         dir.path(),
         Options {
-            max_segment_size: 40,
+            max_segment_size: 100,
         },
     )
     .unwrap();
 
-    // Force at least one rollover so there is a sealed segment to compact...
-    db.put(b"sealed-key", b"sealed-value-long-enough-to-roll").unwrap();
-    db.put(b"another", b"to-force-rollover").unwrap();
+    db.put(b"filler-1", b"aaaaaaaaaaaaaaaaaaaa").unwrap(); // 49 bytes, running 49
+    db.put(b"filler-2", b"bbbbbbbbbbbbbbbbbbbb").unwrap(); // 49 bytes, running 98
+    db.put(b"filler-3", b"c").unwrap(); // 30 bytes, running 128 -> rolls to segment 1
 
-    // ...then write a key that stays in the still-open active segment.
+    // This key's encoded size (43 bytes) stays under 100 on the fresh
+    // segment 1, so it remains genuinely in the *active* segment below.
     db.put(b"active-key", b"active-value").unwrap();
-    let active_value_before = db.get(b"active-key").unwrap();
-    assert_eq!(active_value_before, Some(b"active-value".to_vec()));
+    assert_eq!(db.get(b"active-key").unwrap(), Some(b"active-value".to_vec()));
 
     db.compact().unwrap();
 
     // The active-segment key must still resolve correctly after the
-    // active segment was renumbered and the reader cache was cleared.
+    // active segment was renumbered and the reader cache was cleared —
+    // compaction must never touch a key that was never in a sealed
+    // segment to begin with.
     assert_eq!(db.get(b"active-key").unwrap(), Some(b"active-value".to_vec()));
+    assert_eq!(db.get(b"filler-1").unwrap(), Some(b"aaaaaaaaaaaaaaaaaaaa".to_vec()));
 
     db.put(b"after-compact", b"still-writable").unwrap();
     assert_eq!(
@@ -1300,7 +1322,14 @@ fn compact_preserves_keys_that_live_in_the_active_segment() {
 - [ ] **Step 3: Run the tests and verify they pass**
 
 Run: `cargo test --test compaction`
-Expected: all 3 tests PASS.
+Expected: all 3 tests PASS. The second test
+(`compact_drops_overwritten_and_deleted_keys_but_keeps_final_state`) is
+the one pinning down the resurrection bug described above: key `b` is put
+in the segment that gets sealed by the first rollover, then deleted by a
+tombstone written to a *later* segment — an implementation that
+recomputes liveness by replaying only the sealed segments (instead of
+consulting the live index) will incorrectly bring `b` back after
+`compact()`, failing this test's `assert_eq!(..., None)` for `b`.
 
 - [ ] **Step 4: Run the full test suite**
 
