@@ -4,6 +4,7 @@
 //! design rationale (on-disk format, recovery, compaction).
 
 mod error;
+mod index;
 mod record;
 mod segment;
 
