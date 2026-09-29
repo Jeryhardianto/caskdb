@@ -5,5 +5,6 @@
 
 mod error;
 mod record;
+mod segment;
 
 pub use error::Error;
