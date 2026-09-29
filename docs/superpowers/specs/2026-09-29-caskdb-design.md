@@ -84,19 +84,43 @@ KeyDir/hint-file lookup works.
 
 `compact()`:
 
-1. Identify all sealed (non-active) segments.
+1. Identify all sealed (non-active) segments (every existing segment file
+   whose id is not the current active segment's id).
 2. Replay them in `file_id` order into a temporary `HashMap<Vec<u8>, (record
    bytes, is_tombstone)>`, keeping only the latest record per key (later
    `file_id`/offset wins).
 3. Write every surviving **non-tombstone** entry into one or more new
    compacted segment files (respecting the same max-size-per-segment rule),
-   with fresh `file_id`s allocated above the current active segment's id.
-4. Rebuild the in-memory index entries for the relocated keys to point at the
-   new segment files.
-5. Delete the old sealed segment files.
-6. The active segment is never touched by compaction, so keys written after
-   compaction started are unaffected and remain correctly the "latest"
-   version (their `file_id` is higher than any compacted segment's).
+   with fresh `file_id`s starting at `old_active_id + 1` and increasing.
+   Starting above the *current* active id (rather than reusing the low end
+   of the range being replaced) guarantees these filenames can never
+   collide with the sealed segments still on disk or the active segment —
+   collision would mean appending compacted output onto the tail of a
+   pre-compaction file instead of a fresh one.
+4. Rename the active segment's file to a new id one past the highest
+   compacted id just written (`last_compacted_id + 1`, or `old_active_id +
+   1` if there were no survivors to write), and update `self.active.file_id`
+   to match. Renaming an open file does not invalidate the already-open
+   file handle on Unix, so the active segment keeps accepting writes
+   uninterrupted. This step is necessary, not optional: without it, the
+   compacted segments (numbered above the old active id) would sort *after*
+   the active segment on the next `open()`, and replay would apply their
+   (older) contents on top of the active segment's (newer) writes,
+   silently reverting recent data.
+5. Update every index entry that pointed at the pre-rename active segment
+   id to the new id (same `value_pos`/`value_size`, just a relocated file),
+   and rebuild the index entries for keys relocated by step 3 to point at
+   their new compacted segment files.
+6. Drop all cached read handles (segment readers keyed by file id), since
+   the set of segment files and which id the active segment lives under
+   both just changed.
+7. Delete the old sealed segment files.
+
+The active segment's *content* is never rewritten by compaction — only its
+file_id changes — so keys written to it during/after compaction are
+unaffected and remain correctly the "latest" version once the renumbering
+in step 4 restores the invariant that the highest file_id is always the
+most recently written segment.
 
 Compaction is not crash-safe across step 3/4/5 boundary for v1 (if the
 process dies mid-compaction, on next `open()` both old and new segments may
